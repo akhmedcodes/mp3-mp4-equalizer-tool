@@ -1,0 +1,13 @@
+{
+  "name": "audio-visualizer",
+  "version": "1.0.0",
+  "description": "Audio to MP4 visualizer — JS/Canvas edition",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^0.1.0",
+    "cli-progress": "^3.12.0"
+  }
+}
