@@ -2,12 +2,19 @@
 'use strict';
 const path = require('path');
 const fs = require('fs');
-const os = require('os');
 const readline = require('readline');
-const { spawnSync, spawn } = require('child_process');
+const { spawnSync } = require('child_process');
 const { extractFeatures } = require('./core/features');
-const { renderFrames } = require('./core/renderer');
+const { renderToVideo } = require('./core/renderer');
 const { TEMPLATES } = require('./core/templates');
+
+const AUDIO_EXTS = new Set(['.mp3', '.wav', '.flac', '.ogg', '.m4a', '.aac', '.opus', '.wma']);
+
+const RESOLUTIONS = {
+    '1080p': [1920, 1080],
+    '720p':  [1280,  720],
+    '480p':  [ 854,  480],
+};
 
 const BANNER = `════════════════════════════════
  🎵  Audio Visualizer  v1.0  [JS]
@@ -21,31 +28,24 @@ function checkFfmpeg() {
     }
 }
 
-function buildVideo(frameDir, audioPath, outputPath, fps = 30) {
-    const pattern = path.join(frameDir, 'frame_%06d.png');
-    const r = spawnSync('ffmpeg', [
-        '-y', '-framerate', String(fps),
-        '-i', pattern,
-        '-i', audioPath,
-        '-c:v', 'libx264', '-crf', '18', '-preset', 'fast',
-        '-c:a', 'aac', '-b:a', '192k',
-        '-shortest', outputPath,
-    ], { stdio: ['ignore', 'ignore', 'pipe'] });
-
-    if (r.status !== 0) {
-        console.error('ffmpeg error:\n' + r.stderr.toString().slice(-1000));
-        process.exit(1);
-    }
+function getOutputPath(audioPath, override = null) {
+    if (override) return override;
+    const base = path.basename(audioPath, path.extname(audioPath));
+    const cacheDir = path.join(process.cwd(), 'cache');
+    if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
+    return path.join(cacheDir, base + '.mp4');
 }
 
 function parseArgs() {
     const args = process.argv.slice(2);
-    const opts = { file: null, output: 'output.mp4', template: null };
+    const opts = { file: null, multiple: null, output: null, template: null, res: '1080p' };
     for (let i = 0; i < args.length; i++) {
         const a = args[i];
-        if ((a === '--file'     || a === '-f') && args[i+1]) opts.file     = args[++i];
-        else if ((a === '--output'   || a === '-o') && args[i+1]) opts.output  = args[++i];
+        if      ((a === '--file'     || a === '-f') && args[i+1]) opts.file     = args[++i];
+        else if ((a === '--multiple' || a === '-m') && args[i+1]) opts.multiple = args[++i];
+        else if ((a === '--output'   || a === '-o') && args[i+1]) opts.output   = args[++i];
         else if ((a === '--template' || a === '-t') && args[i+1]) opts.template = parseInt(args[++i], 10);
+        else if ((a === '--res'      || a === '-r') && args[i+1]) opts.res      = args[++i];
     }
     return opts;
 }
@@ -66,26 +66,96 @@ async function pickTemplate() {
     });
 }
 
+async function runMultiple(folder, templateIdx, width, height) {
+    const files = fs.readdirSync(folder)
+        .filter(f => AUDIO_EXTS.has(path.extname(f).toLowerCase()))
+        .map(f => path.join(folder, f))
+        .sort();
+
+    if (files.length === 0) {
+        console.error('No audio files found in: ' + folder);
+        process.exit(1);
+    }
+
+    console.log(`\nFound ${files.length} audio file(s). Max 3 concurrent renders.\n`);
+
+    const cliProgress = require('cli-progress');
+    const multibar = new cliProgress.MultiBar({
+        format: ' {label} [{bar}] {percentage}%  {value}/{total} frames  ETA {eta_formatted}',
+        barCompleteChar: '█',
+        barIncompleteChar: '░',
+        hideCursor: true,
+        clearOnComplete: false,
+        stopOnComplete: false,
+        forceRedraw: true,
+    }, cliProgress.Presets.shades_classic);
+
+    let fileIdx = 0;
+    const done = [];
+    const errors = [];
+
+    const runSlot = async () => {
+        while (true) {
+            const i = fileIdx++;
+            if (i >= files.length) break;
+
+            const audioPath = files[i];
+            const name = path.basename(audioPath);
+            const outputPath = getOutputPath(audioPath);
+            const label = name.slice(0, 26).padEnd(26);
+
+            multibar.log(`  Analyzing: ${name}\n`);
+            let features;
+            try {
+                features = extractFeatures(audioPath);
+            } catch (err) {
+                errors.push({ file: name, err });
+                continue;
+            }
+
+            try {
+                await renderToVideo(features, templateIdx, audioPath, outputPath, { width, height, barContainer: multibar, label });
+                done.push({ name, outputPath });
+                multibar.log(`  ✓ ${name} → ${outputPath}\n`);
+            } catch (err) {
+                errors.push({ file: name, err });
+                multibar.log(`  ✗ ${name}: ${err.message || err.stack || String(err)}\n`);
+            }
+        }
+    };
+
+    const concurrency = Math.min(3, files.length);
+    await Promise.all(Array.from({ length: concurrency }, runSlot));
+    multibar.stop();
+
+    if (errors.length > 0) {
+        console.log('\nErrors:');
+        errors.forEach(({ file, err }) => console.log(`  ✗ ${file}: ${err.message}`));
+    }
+    console.log(`\n✓ Completed ${done.length}/${files.length} file(s).`);
+}
+
 async function main() {
     const opts = parseArgs();
-
     checkFfmpeg();
 
-    if (!opts.file) {
-        console.error('Usage: node app.js --file <audio> [--output output.mp4] [--template 1-20]');
-        process.exit(1);
-    }
-    if (!fs.existsSync(opts.file)) {
-        console.error(`Error: audio file not found: ${opts.file}`);
+    if (!opts.file && !opts.multiple) {
+        console.error([
+            'Usage:',
+            '  node app.js --file <audio> [--output out.mp4] [--template 1-20] [--res 1080p|720p|480p]',
+            '  node app.js --multiple <folder> [--template 1-20] [--res 1080p|720p|480p]',
+        ].join('\n'));
         process.exit(1);
     }
 
+    const res = RESOLUTIONS[opts.res];
+    if (!res) {
+        console.error(`Error: --res must be one of: ${Object.keys(RESOLUTIONS).join(', ')}`);
+        process.exit(1);
+    }
+    const [width, height] = res;
+
     console.log(BANNER);
-    process.stdout.write('Analyzing audio… ');
-    const features = extractFeatures(opts.file);
-    console.log('done.');
-    console.log(`File: ${path.basename(opts.file)}`);
-    console.log(`Duration: ${features.duration.toFixed(1)}s  |  BPM: ${features.tempo.toFixed(0)}`);
 
     let templateIdx;
     if (opts.template != null) {
@@ -98,20 +168,34 @@ async function main() {
         templateIdx = await pickTemplate();
     }
 
+    if (opts.multiple) {
+        if (!fs.existsSync(opts.multiple) || !fs.statSync(opts.multiple).isDirectory()) {
+            console.error('Error: folder not found: ' + opts.multiple);
+            process.exit(1);
+        }
+        await runMultiple(opts.multiple, templateIdx, width, height);
+        return;
+    }
+
+    // Single file mode
+    if (!fs.existsSync(opts.file)) {
+        console.error(`Error: audio file not found: ${opts.file}`);
+        process.exit(1);
+    }
+
+    process.stdout.write('Analyzing audio… ');
+    const features = extractFeatures(opts.file);
+    console.log('done.');
+    console.log(`File: ${path.basename(opts.file)}`);
+    console.log(`Duration: ${features.duration.toFixed(1)}s  |  BPM: ${features.tempo.toFixed(0)}  |  Res: ${width}x${height}`);
+
     const templateName = TEMPLATES[templateIdx].name;
     console.log(`\nRendering: ${templateName} (${features.totalFrames} frames @ 30fps)`);
 
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'av_frames_'));
-    try {
-        await renderFrames(features, templateIdx, tmpDir);
-        process.stdout.write('\nBuilding video… ');
-        buildVideo(tmpDir, opts.file, opts.output);
-        console.log('done.');
-    } finally {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
+    const outputPath = getOutputPath(opts.file, opts.output);
+    await renderToVideo(features, templateIdx, opts.file, outputPath, { width, height });
 
-    console.log(`\n✓ Done! → ${opts.output}`);
+    console.log(`\n✓ Done! → ${outputPath}`);
 }
 
 main().catch(err => { console.error(err.message || err); process.exit(1); });
